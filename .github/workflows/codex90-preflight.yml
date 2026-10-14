@@ -1,0 +1,112 @@
+name: Pkl numeric union preflight
+on:
+  workflow_dispatch:
+    inputs:
+      tested_sha:
+        description: Full contribution SHA
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  build-test-codeql:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ inputs.tested_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify tested SHA and upstream baseline
+        env:
+          EXPECTED_SHA: ${{ inputs.tested_sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          git remote add upstream https://github.com/apple/pkl-intellij.git
+          git fetch upstream main
+          git rev-parse HEAD upstream/main
+          git merge-base --is-ancestor upstream/main HEAD
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
+        with:
+          java-version: '17'
+          distribution: temurin
+          cache: gradle
+      - uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2
+        with:
+          languages: java-kotlin
+          build-mode: manual
+      - name: Full repository checks and build
+        env:
+          PKL_ORIGINAL_REMOTE_NAME: upstream
+        run: |
+          java -version
+          ./gradlew cleanTest check build --console=plain
+      - name: Record test execution
+        run: |
+          python3 - <<'PYTEST'
+          from pathlib import Path
+          import xml.etree.ElementTree as E
+          files = list(Path('build/test-results/test').glob('TEST-*.xml'))
+          assert files, 'No test results'
+          roots = [E.parse(p).getroot() for p in files]
+          totals = {k: sum(int(r.attrib.get(k, 0)) for r in roots) for k in ['tests', 'failures', 'errors', 'skipped']}
+          print(totals)
+          assert totals['tests'] > 0 and totals['failures'] == totals['errors'] == 0
+          regressions = E.parse('build/test-results/test/TEST-org.pkl.intellij.annotator.PklNumberTypeMatchingTest.xml').getroot()
+          print('Numeric union regressions:', regressions.attrib)
+          assert int(regressions.attrib['tests']) == 6 and int(regressions.attrib['skipped']) == 0
+          for r in roots:
+              for t in r.findall('testcase'):
+                  if t.find('skipped') is not None:
+                      print('SKIPPED:', r.attrib['name'], t.attrib['name'])
+          PYTEST
+      - uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2
+        with:
+          category: /language:java-kotlin
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4
+        if: always()
+        with:
+          name: validation-reports
+          path: |
+            build/test-results/**/*.xml
+            build/reports/tests/**/*
+            build/reports/pluginVerifier/**/*
+  generated-workflows-and-actions-codeql:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ inputs.tested_sha }}
+          persist-credentials: false
+      - name: Verify tested SHA
+        env:
+          EXPECTED_SHA: ${{ inputs.tested_sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Install upstream workflow generator
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/pkl"
+          gh release download 0.30.0 --repo apple/pkl --pattern pkl-linux-amd64 --dir "$RUNNER_TEMP/pkl"
+          chmod +x "$RUNNER_TEMP/pkl/pkl-linux-amd64"
+      - name: Reproduce generated workflow check
+        run: |
+          rm -rf .github/**/[a-z]*.yml
+          "$RUNNER_TEMP/pkl/pkl-linux-amd64" eval -m .github/ --project-dir .github/ .github/index.pkl
+          git diff --exit-code
+          test -z "$(git status --porcelain)"
+      - uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2
+        with:
+          languages: actions
+          build-mode: none
+      - uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2
+        with:
+          category: /language:actions
